@@ -15,3 +15,10 @@ data/
 
 # UV stuff
 .uv/
+
+# Raw capture output. Market data stays local.
+bench/data/
+
+# Capture process logs and pid. bench/results/env.txt is kept.
+bench/results/*.log
+bench/results/*.pid
