@@ -118,6 +118,12 @@ class ReplayFrame:
 
 
 class OrderBookReplay:
+    """Reads recorded top-N state frames back in file order.
+
+    This re-reads what ``OrderBookRecorder`` wrote; it does not rebuild a
+    book. For deterministic replay from raw diffs use ``orderbook.replay``.
+    """
+
     def __init__(self, config: OrderBookConfig, data_dir: str | None = None):
         self.config = config
         self._data_dir = Path(data_dir or config.storage_dir)
@@ -132,7 +138,6 @@ class OrderBookReplay:
     def replay(
         self,
         files: list[Path] | None = None,
-        speed: float = 1.0,
         loop: bool = False,
     ):
         files = files or self.list_files()

@@ -2,7 +2,8 @@ import asyncio
 import contextvars
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import aiohttp
 import websockets
@@ -20,6 +21,10 @@ class DepthEvent:
     final_update_id: int
     bids: list[tuple[float, float]]
     asks: list[tuple[float, float]]
+    # Local receive time (time.time_ns, taken before parsing) and the frame
+    # exactly as received. Set by stream_depth_events; used by the raw log.
+    recv_ns: int = field(default=0, compare=False)
+    raw: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -27,6 +32,9 @@ class OrderBookSnapshot:
     last_update_id: int
     bids: list[tuple[float, float]]
     asks: list[tuple[float, float]]
+    # Local receive time and the decoded REST body with its original strings.
+    recv_ns: int = field(default=0, compare=False)
+    raw: dict | None = field(default=None, repr=False, compare=False)
 
 
 class _Reconnected:
@@ -51,7 +59,7 @@ class SnapshotError(RuntimeError):
         self.retryable = retryable
 
 
-def _parse_depth_event(raw: str) -> DepthEvent:
+def _parse_depth_event(raw: str, recv_ns: int = 0) -> DepthEvent:
     data = json.loads(raw)
     return DepthEvent(
         event_time=data["E"],
@@ -60,6 +68,18 @@ def _parse_depth_event(raw: str) -> DepthEvent:
         final_update_id=data["u"],
         bids=[(float(p), float(q)) for p, q in data["b"]],
         asks=[(float(p), float(q)) for p, q in data["a"]],
+        recv_ns=recv_ns,
+        raw=raw,
+    )
+
+
+def parse_snapshot(data: dict, recv_ns: int = 0) -> OrderBookSnapshot:
+    return OrderBookSnapshot(
+        last_update_id=data["lastUpdateId"],
+        bids=[(float(p), float(q)) for p, q in data["bids"]],
+        asks=[(float(p), float(q)) for p, q in data["asks"]],
+        recv_ns=recv_ns,
+        raw=data,
     )
 
 
@@ -81,7 +101,10 @@ async def stream_depth_events(config: OrderBookConfig):
                 connected_before = True
 
                 async for raw_message in ws:
-                    yield _parse_depth_event(raw_message)
+                    recv_ns = time.time_ns()
+                    if isinstance(raw_message, bytes):
+                        raw_message = raw_message.decode()
+                    yield _parse_depth_event(raw_message, recv_ns)
 
         except websockets.ConnectionClosed as e:
             logger.warning(f"Connection closed: {e}")
@@ -182,11 +205,7 @@ async def fetch_snapshot(config: OrderBookConfig, session=None) -> OrderBookSnap
                     status = response.status
                     if status == 200:
                         data = await response.json()
-                        return OrderBookSnapshot(
-                            last_update_id=data["lastUpdateId"],
-                            bids=[(float(p), float(q)) for p, q in data["bids"]],
-                            asks=[(float(p), float(q)) for p, q in data["asks"]],
-                        )
+                        return parse_snapshot(data, time.time_ns())
                     if status in _RETRYABLE_STATUS:
                         delay = _retry_after_seconds(response.headers)
                     elif status < 500:

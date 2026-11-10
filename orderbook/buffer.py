@@ -216,12 +216,17 @@ async def _fetch_after(delay: float, config: OrderBookConfig) -> OrderBookSnapsh
 async def stream_book(
     config: OrderBookConfig,
     synchronizer: BookSynchronizer | None = None,
+    *,
+    recorder=None,
 ) -> AsyncGenerator[OrderBookState, None]:
     """Yield the book state after every applied diff, forever.
 
     The book is rebuilt from a fresh snapshot after any gap, reconnect,
     crossed book or overflow. REST errors are retried with backoff and never
     end the stream. Pass ``synchronizer`` to inspect ``.book`` and ``.stats``.
+    Pass ``recorder`` (``orderbook.replay.RawRecorder``) to log every input in
+    the order the synchronizer consumes it; ``replay_raw`` reproduces the
+    same states offline.
 
     Slow consumers: frames read but not yet consumed are bounded by
     ``config.max_buffer_events``. When that bound is hit the unread frames are
@@ -267,6 +272,8 @@ async def stream_book(
                     logger.warning(f"{exc}; will retry")
                     sync.note_snapshot_failure()
                     continue
+                if recorder is not None:
+                    recorder.snapshot(snapshot)
                 for state in sync.on_snapshot(snapshot):
                     yield state
                 continue
@@ -274,10 +281,16 @@ async def stream_book(
             if pending:
                 item = pending.popleft()
                 if item is RECONNECTED:
+                    if recorder is not None:
+                        recorder.reconnect()
                     sync.on_reconnect()
                 elif item is _OVERFLOW:
+                    if recorder is not None:
+                        recorder.overflow()
                     sync.on_overflow()
                 else:
+                    if recorder is not None:
+                        recorder.depth(item)
                     state = sync.on_event(item)
                     if state is not None:
                         yield state

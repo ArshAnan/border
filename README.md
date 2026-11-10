@@ -13,7 +13,7 @@ A high-performance, async Python library for real-time order book reconstruction
 - **Exponential backoff reconnection** — configurable retry logic with bounded backoff
 - **Feature extraction** — computes spread, order book imbalance, weighted mid price, VWAP, cumulative depth, and price impact estimates from raw book state
 - **Parquet recording** — columnar storage via `pyarrow` with Snappy compression; schema-stable across sessions
-- **Deterministic replay** — replay engine serves recorded data at arbitrary speed with optional looping for backtesting and simulation
+- **Deterministic replay** — raw diffs and snapshots are logged in the order the synchronizer consumed them and replayed offline through the same code; replay does not reproduce timing
 
 ---
 
@@ -75,15 +75,19 @@ async for state in stream_book(config):
 recorder.close()
 ```
 
-### Replay recorded data
+### Record raw diffs and replay them offline
 
 ```python
-from orderbook.storage import OrderBookReplay
+from orderbook.replay import RawRecorder, replay_raw
 
-replay = OrderBookReplay(config)
+recorder = RawRecorder(config)            # data/raw/*.jsonl.gz
+async for state in stream_book(config, recorder=recorder):
+    ...
+recorder.close()
 
-for frame in replay.replay(loop=True):
-    print(frame.timestamp_ms, frame.features.shape)
+# Later, with no network: same synchronizer, same inputs, same states.
+for state in replay_raw(sorted(Path("data/raw").glob("BTCUSDT_raw_*.jsonl.gz")), config):
+    ...
 ```
 
 ---
@@ -107,7 +111,8 @@ Binance WebSocket (@depth@100ms)
      features.py         — numerical feature extraction (spread, imbalance, VWAP, depth)
           │
           ▼
-      storage.py         — Parquet recorder + deterministic replay engine
+      storage.py         — Parquet top-N state frames (recorder + reader)
+      replay.py          — raw diff log + offline replay through the synchronizer
 ```
 
 ---
@@ -177,22 +182,28 @@ The snapshot depth is `snapshot_depth_limit` (default 1000; the docs now show
 
 ---
 
-## Replay Engine
+## Replay
 
-Recorded Parquet files can be replayed deterministically for backtesting or simulation:
+`RawRecorder` logs every input the synchronizer consumes, in the order it
+consumes it: raw depth frames with a local `time.time_ns` receive time, each
+REST snapshot body, reconnects and overflows. Segments are gzip JSONL (the
+line format of `bench/capture_raw.py`), at most `max_records` records each,
+written to a temp file, fsynced and renamed, so every segment on disk is
+complete.
 
-```python
-replay = OrderBookReplay(config, data_dir="data/")
-files = replay.list_files(symbol="BTCUSDT")
+`replay_raw` feeds a log through a fresh `BookSynchronizer` with no network
+and yields the same states the live run published, provided `num_levels` and
+`max_buffer_events` match. It does not reproduce timing. From the shell:
 
-for frame in replay.replay(files=files, loop=False):
-    # frame.timestamp_ms  — original event timestamp
-    # frame.last_update_id — sequence ID
-    # frame.features       — numpy float64 array, shape (129,)
-    pass
+```bash
+python -m orderbook.replay --num-levels 20 data/raw/BTCUSDT_raw_*.jsonl.gz
 ```
 
-Files are named `{SYMBOL}_{TIMESTAMP}_{COUNT}.parquet` and sorted chronologically. Train/validation/test splits should be made by time — never shuffle across episode boundaries.
+prints the number of states and a SHA-256 over them.
+
+`OrderBookReplay` in `storage.py` only re-reads the top-N state frames written
+by `OrderBookRecorder` (stamped with the local clock); it does not rebuild a
+book.
 
 ---
 
