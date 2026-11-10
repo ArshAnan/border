@@ -14,6 +14,19 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Slow-consumer policy: the queue is bounded and the producer blocks when it
+# is full, so the consumer applies backpressure instead of growing memory.
+# While the producer is blocked, stream_book keeps reading the socket into its
+# own buffer, bounded by config.max_buffer_events. If that fills, the unread
+# frames are dropped and the book is rebuilt from a fresh snapshot (visible in
+# sync.stats.overflows / resyncs). States are never silently skipped: either
+# every state reaches the consumer, or a resync is recorded.
+QUEUE_MAXSIZE = 1_000
+
+
+def make_queue() -> asyncio.Queue:
+    return asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+
 
 async def producer(
     config: OrderBookConfig, sync: BookSynchronizer, queue: asyncio.Queue
@@ -51,7 +64,7 @@ async def consumer(
             print(f"\n--- Order Book ({config.symbol}) | update #{event_count} ---")
             print(f"Mid price : ${state.mid_price:,.2f}")
             print(f"Spread    : ${state.spread:.2f}")
-            print(f"Queue size: {queue.qsize()}")  # watch this — should stay near 0
+            print(f"Queue size: {queue.qsize()}/{queue.maxsize}")
 
             print(f"Resyncs   : {sync.stats.resyncs}")
 
@@ -67,7 +80,7 @@ async def main():
     logger.info(f"Starting order book for {config.symbol}")
     logger.info(f"Feature vector size: {feature_size(config)}")
 
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = make_queue()
 
     producer_task = asyncio.create_task(producer(config, sync, queue))
     consumer_task = asyncio.create_task(

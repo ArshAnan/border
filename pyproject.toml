@@ -1,7 +1,7 @@
 [project]
 name = "binance-orderbook"
 version = "0.1.0"
-description = "A high-performance real-time orderbook library for Binance"
+description = "Async Binance.US L2 order book reconstruction with raw diff recording and offline replay"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

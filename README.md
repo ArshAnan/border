@@ -1,18 +1,18 @@
 # border
 
-A high-performance, async Python library for real-time order book reconstruction from Binance WebSocket streams. Maintains a fully synchronized local L2 order book via incremental diff application, with sequence validation, automatic resync on gap detection, and Parquet-based recording and deterministic replay.
+An async Python library for real-time L2 order book reconstruction from Binance.US depth streams (`stream.binance.us`, `api.binance.us`). It keeps a local book in sync by applying incremental diffs with sequence validation, rebuilds it from a fresh snapshot after any gap, records the raw diffs, and replays them offline through the same sync code.
 
 ---
 
 ## Features
 
-- **Real-time L2 reconstruction** — incremental diff application via Binance `@depth@100ms` stream
-- **Sequence validation** — enforces gapless update sequencing per Binance's sync protocol; triggers automatic resync on any detected gap
-- **O(log n) updates** — price level insertions and deletions via `SortedDict`; best bid/ask access in O(1)
+- **Real-time L2 reconstruction** — incremental diff application via the Binance.US `@depth@100ms` stream
+- **Sequence validation** — enforces gapless update sequencing per the Binance.US order book procedure; a gap, reconnect, crossed book or buffer overflow rebuilds the book from a fresh snapshot
+- **Sorted book** — price levels in `SortedDict`: an update is O(log n), best bid/ask is O(log n), and `top_levels(N)` is O(N) per call (it builds a new list each time). The book keeps every level; `num_levels` only limits what is output
 - **Async-first** — built entirely on `asyncio`, `websockets`, and `aiohttp`; non-blocking throughout
-- **Exponential backoff reconnection** — configurable retry logic with bounded backoff
-- **Feature extraction** — computes spread, order book imbalance, weighted mid price, VWAP, cumulative depth, and price impact estimates from raw book state
-- **Parquet recording** — columnar storage via `pyarrow` with Snappy compression; schema-stable across sessions
+- **Bounded backoff** — WebSocket reconnects and REST snapshot retries (429/418/5xx, honoring `Retry-After`) use bounded exponential backoff over one `aiohttp` session
+- **Feature extraction** — top of book, top-N depth, imbalance, weighted mid, spread in bps, cumulative depth and recent mid-price returns
+- **Parquet feature frames** — one row per published state (feature vector + update id + local wall clock), written atomically; the schema is the feature layout
 - **Deterministic replay** — raw diffs and snapshots are logged in the order the synchronizer consumed them and replayed offline through the same code; replay does not reproduce timing
 
 ---
@@ -95,7 +95,7 @@ for state in replay_raw(sorted(Path("data/raw").glob("BTCUSDT_raw_*.jsonl.gz")),
 ## Architecture
 
 ```
-Binance WebSocket (@depth@100ms)
+Binance.US WebSocket (@depth@100ms)
           │
           ▼
       client.py          — async WebSocket client, exponential backoff reconnection
@@ -105,10 +105,10 @@ Binance WebSocket (@depth@100ms)
       sync.py            — stream_book(): live driver (public API)
           │
           ▼
-        book.py          — SortedDict L2 book, O(log n) incremental updates
+        book.py          — SortedDict L2 book; O(log n) updates, O(N) top_levels
           │
           ▼
-     features.py         — numerical feature extraction (spread, imbalance, VWAP, depth)
+     features.py         — feature vector (layout in feature_names())
           │
           ▼
       storage.py         — Parquet top-N state frames (recorder + reader)
@@ -127,13 +127,17 @@ from orderbook.config import OrderBookConfig
 config = OrderBookConfig(
     symbol="BTCUSDT",
     depth_update_speed="100ms",   # "100ms" or "1000ms"
-    snapshot_depth_limit=1000,    # 100, 500, or 1000
-    num_levels=20,                # price levels to maintain
+    snapshot_depth_limit=1000,    # REST depth limit (docs allow up to 5000)
+    num_levels=20,                # levels output per state (the book keeps all)
     max_reconnect_attempts=10,
     base_backoff_seconds=1.0,
     max_backoff_seconds=60.0,
     storage_dir="data",
-    snapshot_interval_seconds=1.0,
+    snapshot_interval_seconds=1.0, # Parquet flush interval
+    max_buffer_events=10_000,     # bound on buffered/unread diffs before a resync
+    rest_max_attempts=8,          # REST snapshot retries per fetch
+    rest_backoff_base_seconds=0.5,
+    rest_backoff_max_seconds=30.0,
 )
 ```
 
@@ -141,17 +145,24 @@ config = OrderBookConfig(
 
 ## Feature Vector
 
-`features.py` produces a fixed-length `float64` numpy array per book state. With `num_levels=20` (default), the vector is **129 elements**:
+`features.py` produces a fixed-length `float64` numpy array per book state.
+Its layout is `feature_names(config)`; the Parquet columns after
+`timestamp_ms` and `last_update_id` are exactly those names, and
+`OrderBookReplay` rebuilds the same vector from them. With the defaults
+(`num_levels=20`, `num_price_returns=10`) the vector is **139 elements**:
 
 | Segment | Size | Description |
 |---|---|---|
 | Top of book | 6 | best bid/ask price and qty, mid price, spread |
-| Bid depth | 2 × N | prices and quantities for top N bid levels |
-| Ask depth | 2 × N | prices and quantities for top N ask levels |
+| Bid depth | 2 × N | prices, then quantities, for the top N bid levels |
+| Ask depth | 2 × N | prices, then quantities, for the top N ask levels |
 | Derived | 3 | imbalance, weighted mid price, spread in bps |
-| Cumulative volume | 2 × N | cumulative bid and ask volume at each level |
+| Cumulative volume | 2 × N | cumulative bid, then ask, volume at each level |
+| Returns | R | last R mid-price returns, oldest first, zero-padded |
 
-Order book imbalance is defined as `bid_vol / (bid_vol + ask_vol)` across the top N levels — values near 1.0 indicate buying pressure, near 0.0 indicate selling pressure.
+Size = 9 + 6N + R. Missing levels are 0.0. Imbalance is
+`bid_vol / (bid_vol + ask_vol)` across the top N levels (0.5 if both are
+zero); values near 1.0 mean more resting bid volume.
 
 ---
 
@@ -210,6 +221,7 @@ book.
 ## Known Limitations / Future Work
 
 - **Gap handling** — any sequence gap discards the book and rebuilds it from a fresh snapshot; there is no partial recovery.
+- **Slow consumers** — `stream_book` bounds unread diffs at `max_buffer_events`; past that it drops them and rebuilds the book. The example's queue is bounded (`QUEUE_MAXSIZE`) and blocks the producer when full.
 - **Single symbol** — one `OrderBook` instance per symbol. Multi-symbol support would require a multiplexed WebSocket connection.
 - **Float64 precision** — prices and quantities are stored as `float64`. For production execution use cases, `Decimal` arithmetic should be considered to avoid floating point rounding on financial values.
 
