@@ -22,6 +22,17 @@ class OrderBookConfig:
     base_backoff_seconds: float = 1.0
     max_backoff_seconds: float = 60.0
 
+    # Sync Settings
+    # Events held while waiting for a snapshot, and events read from the
+    # socket but not yet consumed. Exceeding either discards the book and
+    # starts a fresh sync.
+    max_buffer_events: int = 10_000
+    # REST snapshot retries (429/418/5xx/network). Retry-After is honored
+    # when present; otherwise the delay doubles up to the max.
+    rest_max_attempts: int = 8
+    rest_backoff_base_seconds: float = 0.5
+    rest_backoff_max_seconds: float = 30.0
+
     # Storage Settings
     storage_dir: str = "data"
     snapshot_interval_seconds: float = 3600.00

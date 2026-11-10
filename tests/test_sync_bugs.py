@@ -215,11 +215,11 @@ async def test_live_gap_rebuilds_the_book_from_a_fresh_snapshot(monkeypatch):
     _pad(exchange, BATCH - 2, start=1)
     exchange.push(100, 101, bids=[(100.0, 2.0)], apply=False)
     exchange.push(102, 102, bids=[(100.0, 2.5)], apply=False)
-    exchange.push(180, 180, bids=[(300.0, 1.0)], apply=False)
+    exchange.push(180, 180, bids=[(99.5, 1.0)], apply=False)
     aligning = _book(100, [(100.0, 1.0)], [(101.0, 1.0)])
-    rebuilt = _book(200, [(100.0, 8.0), (200.0, 5.0)], [(101.0, 1.0)])
+    rebuilt = _book(200, [(100.0, 8.0), (99.0, 5.0)], [(101.0, 1.0)])
     _pad(exchange, BATCH - 1, start=151)
-    post = exchange.push(200, 201, bids=[(300.0, 1.0)], apply=False)
+    post = exchange.push(200, 201, bids=[(99.5, 1.0)], apply=False)
 
     result = await _drive(
         monkeypatch,
@@ -241,11 +241,11 @@ async def test_reconnect_rebuilds_the_book_from_a_fresh_snapshot(monkeypatch):
     _pad(exchange, BATCH - 1, start=1)
     exchange.push(100, 101, bids=[(100.0, 2.0)], apply=False)
     exchange.inject_reconnect()
-    exchange.push(500, 500, bids=[(300.0, 1.0)], apply=False)
+    exchange.push(500, 500, bids=[(99.5, 1.0)], apply=False)
     aligning = _book(100, [(100.0, 1.0)], [(101.0, 1.0)])
-    rebuilt = _book(600, [(100.0, 8.0), (200.0, 5.0)], [(101.0, 1.0)])
+    rebuilt = _book(600, [(100.0, 8.0), (99.0, 5.0)], [(101.0, 1.0)])
     _pad(exchange, BATCH - 1, start=551)
-    post = exchange.push(600, 601, bids=[(300.0, 1.0)], apply=False)
+    post = exchange.push(600, 601, bids=[(99.5, 1.0)], apply=False)
 
     result = await _drive(
         monkeypatch,
@@ -356,7 +356,7 @@ async def test_snapshot_fetches_share_one_client_session(monkeypatch):
     exchange.push(102, 102, bids=[(100.0, 2.5)], apply=False)
     exchange.push(180, 180, apply=False)
     aligning = _book(100, [(100.0, 1.0)], [(101.0, 1.0)])
-    rebuilt = _book(200, [(100.0, 8.0), (200.0, 5.0)], [(101.0, 1.0)])
+    rebuilt = _book(200, [(100.0, 8.0), (99.0, 5.0)], [(101.0, 1.0)])
     _pad(exchange, BATCH - 1, start=151)
     exchange.push(200, 201, apply=False)
     exchange.queue_snapshot(snapshot=aligning)

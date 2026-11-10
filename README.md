@@ -38,46 +38,39 @@ pip install -e .
 
 ## Quickstart
 
-### Stream live order book events
+### Stream a live order book
 
 ```python
 import asyncio
-from orderbook.book import OrderBook
-from orderbook.buffer import DepthEventBuffer
-from orderbook.client import fetch_snapshot
 from orderbook.config import OrderBookConfig
+from orderbook.sync import stream_book
 
 async def main():
     config = OrderBookConfig(symbol="BTCUSDT")
-    buffer = DepthEventBuffer(config)
-    book = OrderBook(config)
-    initialized = False
-
-    async for event in buffer.stream_validated_events():
-        if not initialized:
-            snapshot = await fetch_snapshot(config)
-            book.initialize(snapshot)
-            initialized = True
-
-        book.apply_event(event)
-        state = book.top_levels()
-        print(f"mid={state.mid_price:.2f} spread={state.spread:.4f}")
+    async for state in stream_book(config):
+        print(f"id={state.last_update_id} mid={state.mid_price:.2f} spread={state.spread:.4f}")
 
 asyncio.run(main())
 ```
 
+`stream_book` owns the diff buffer, the REST snapshot and the book, so the
+snapshot that validates the buffered diffs is the one that seeds the book. It
+yields the top-N state after every applied diff and never ends on its own: a
+gap, reconnect, crossed book or buffer overflow rebuilds the book from a fresh
+snapshot, and REST 429/418/5xx responses are retried with backoff. Pass a
+`BookSynchronizer` to read `.book` and `.stats`.
+
 ### Record to Parquet
 
 ```python
+from orderbook.features import FeatureExtractor
 from orderbook.storage import OrderBookRecorder
 
+extractor = FeatureExtractor(config)
 recorder = OrderBookRecorder(config)
 
-async for event in buffer.stream_validated_events():
-    ...
-    book.apply_event(event)
-    state = book.top_levels()
-    recorder.record(state)
+async for state in stream_book(config):
+    recorder.record(state, extractor.update(state))
 
 recorder.close()
 ```
@@ -104,7 +97,8 @@ Binance WebSocket (@depth@100ms)
       client.py          — async WebSocket client, exponential backoff reconnection
           │
           ▼
-      buffer.py          — event queue, REST snapshot alignment, sequence validation
+      buffer.py          — BookSynchronizer: buffer + snapshot + book, sequence rules
+      sync.py            — stream_book(): live driver (public API)
           │
           ▼
         book.py          — SortedDict L2 book, O(log n) incremental updates
@@ -158,14 +152,28 @@ Order book imbalance is defined as `bid_vol / (bid_vol + ask_vol)` across the to
 
 ## Sync Protocol
 
-`border` follows Binance's official order book management protocol:
+`border` follows the Binance.US "Managing a Local Order Book" procedure
+(<https://docs.binance.us/#managing-a-local-order-book>; the Binance spot
+document has the same steps):
 
-1. Open WebSocket stream and buffer incoming diff events
-2. Once buffer reaches threshold, fetch REST snapshot via `GET /api/v3/depth`
-3. Drop all buffered events where `final_update_id < snapshot.last_update_id`
-4. Find first valid event satisfying `first_update_id <= last_update_id <= final_update_id`
-5. Apply all subsequent events in sequence order
-6. On any sequence gap: discard book, re-fetch snapshot, re-establish sync
+1. Open the WebSocket stream and buffer diff events.
+2. Fetch a REST snapshot (`GET /api/v3/depth`) concurrently; the socket keeps
+   being read while the request is in flight.
+3. If the snapshot's `lastUpdateId + 1` is before the first buffered `U`,
+   fetch another snapshot.
+4. Drop buffered events with `u <= lastUpdateId`.
+5. Seed the book from that same snapshot and apply every buffered and live
+   event with one rule: ignore `u <= book_id`; `U > book_id + 1` is a gap;
+   otherwise apply and set `book_id = u`. The first applied event therefore
+   satisfies `U <= lastUpdateId + 1 <= u`. (The docs say the first event
+   should contain `lastUpdateId`; an event that starts exactly at
+   `lastUpdateId + 1` misses nothing and is accepted, as the docs' own update
+   procedure does.)
+6. On a gap, reconnect, crossed book or buffer overflow: discard the book,
+   fetch a fresh snapshot and rebuild.
+
+The snapshot depth is `snapshot_depth_limit` (default 1000; the docs now show
+5000). Levels outside the snapshot are unknown until they change.
 
 ---
 
@@ -190,7 +198,7 @@ Files are named `{SYMBOL}_{TIMESTAMP}_{COUNT}.parquet` and sorted chronologicall
 
 ## Known Limitations / Future Work
 
-- **Gap handling** — current implementation triggers a full resync on any sequence gap. A more durable approach would attempt targeted recovery by fetching a fresh snapshot and continuing without full restart. This is tracked as a known improvement.
+- **Gap handling** — any sequence gap discards the book and rebuilds it from a fresh snapshot; there is no partial recovery.
 - **Single symbol** — one `OrderBook` instance per symbol. Multi-symbol support would require a multiplexed WebSocket connection.
 - **Float64 precision** — prices and quantities are stored as `float64`. For production execution use cases, `Decimal` arithmetic should be considered to avoid floating point rounding on financial values.
 

@@ -9,6 +9,10 @@ from orderbook.config import OrderBookConfig
 logger = logging.getLogger(__name__)
 
 
+class SequenceGapError(RuntimeError):
+    """An event starts after ``last_update_id + 1``; updates were missed."""
+
+
 @dataclass
 class PriceLevel:
     price: float
@@ -36,10 +40,12 @@ class OrderBook:
         self._asks.clear()
 
         for price, quantity in snapshot.bids:
-            self._bids[-price] = quantity
+            if quantity != 0.0:
+                self._bids[-price] = quantity
 
         for price, quantity in snapshot.asks:
-            self._asks[price] = quantity
+            if quantity != 0.0:
+                self._asks[price] = quantity
 
         self._last_update_id = snapshot.last_update_id
         logger.info(
@@ -48,7 +54,27 @@ class OrderBook:
             f"bids={len(self._bids)}, asks={len(self._asks)}"
         )
 
-    def apply_event(self, event: DepthEvent) -> None:
+    @property
+    def last_update_id(self) -> int | None:
+        return self._last_update_id
+
+    def apply_event(self, event: DepthEvent) -> bool:
+        """Apply one diff. Return False if it is already reflected in the book.
+
+        An event with ``u <= last_update_id`` is ignored, so the update id
+        never moves backward. An event with ``U > last_update_id + 1`` raises
+        ``SequenceGapError`` and leaves the book unchanged.
+        """
+        if self._last_update_id is None:
+            raise RuntimeError("apply_event called before initialize")
+        if event.final_update_id <= self._last_update_id:
+            return False
+        if event.first_update_id > self._last_update_id + 1:
+            raise SequenceGapError(
+                f"gap: book at {self._last_update_id}, event starts at "
+                f"{event.first_update_id}"
+            )
+
         for price, quantity in event.bids:
             if quantity == 0.0:
                 self._bids.pop(-price, None)
@@ -62,6 +88,13 @@ class OrderBook:
                 self._asks[price] = quantity
 
         self._last_update_id = event.final_update_id
+        return True
+
+    def is_crossed(self) -> bool:
+        """True when both sides exist and best bid >= best ask."""
+        if not self._bids or not self._asks:
+            return False
+        return -self._bids.peekitem(0)[0] >= self._asks.peekitem(0)[0]
 
     def best_bid(self) -> PriceLevel | None:
         if not self._bids:

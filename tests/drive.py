@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from orderbook.book import OrderBook, OrderBookState
-from orderbook.buffer import DepthEventBuffer
 from orderbook.client import DepthEvent, OrderBookSnapshot
 from orderbook.config import OrderBookConfig
 
@@ -84,6 +83,8 @@ async def drive_quickstart(
                 if until is not None and until(result):
                     return
             return
+
+        from orderbook.buffer import DepthEventBuffer  # legacy API only
 
         initialized = False
         async for event in DepthEventBuffer(config).stream_validated_events():

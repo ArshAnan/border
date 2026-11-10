@@ -161,13 +161,21 @@ class FakeExchange:
         crossed_price = min(self.asks)
         return self.emit(bids=[(crossed_price, 1.0)])
 
-    def inject_reconnect(self) -> None:
-        """Drop the socket the way the real client hides a reconnect.
+    def inject_reconnect(self, *, announce: bool = False) -> None:
+        """Drop the socket.
 
-        The depth generator stays open. Events queued after this sentinel are
-        the first frames of the new connection.
+        By default the reconnect is hidden, the way the pre-fix client hid it.
+        ``announce=True`` yields ``orderbook.client.RECONNECTED`` like the
+        fixed client does. Events queued after this are the first frames of
+        the new connection.
         """
-        self._inbox.put_nowait(_RECONNECT)
+        self.reconnects += announce
+        if announce:
+            from orderbook.client import RECONNECTED
+
+            self._inbox.put_nowait(RECONNECTED)
+        else:
+            self._inbox.put_nowait(_RECONNECT)
 
     def close_stream(self) -> None:
         self._inbox.put_nowait(_CLOSE)
@@ -288,8 +296,12 @@ class _RestResponse:
         return False
 
 
-def client_session_factory(exchange: FakeExchange):
-    """``aiohttp.ClientSession`` replacement that serves ``exchange.rest_script``."""
+def client_session_factory(exchange: FakeExchange, *, live: bool = False):
+    """``aiohttp.ClientSession`` replacement that serves ``exchange.rest_script``.
+
+    With ``live=True`` an empty script serves the exchange's current book
+    instead of failing, so a test can script only the faults.
+    """
 
     created: list[object] = []
 
@@ -305,7 +317,9 @@ def client_session_factory(exchange: FakeExchange):
 
         def get(self, url, params=None, timeout=None) -> _RestResponse:
             if not exchange.rest_script:
-                raise AssertionError("REST snapshot requested with an empty script")
+                if not live:
+                    raise AssertionError("REST snapshot requested with an empty script")
+                exchange.queue_snapshot()
             script = exchange.rest_script.pop(0)
             headers = {}
             if script.retry_after is not None:
