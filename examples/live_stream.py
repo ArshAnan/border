@@ -1,12 +1,11 @@
 import asyncio
 import logging
 
-from orderbook.book import OrderBook
-from orderbook.buffer import DepthEventBuffer
-from orderbook.client import fetch_snapshot, DepthEvent
+from orderbook.book import OrderBookState
 from orderbook.config import OrderBookConfig
 from orderbook.features import FeatureExtractor, feature_size
 from orderbook.storage import OrderBookRecorder
+from orderbook.sync import BookSynchronizer, stream_book
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,78 +14,77 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Slow-consumer policy: the queue is bounded and the producer blocks when it
+# is full, so the consumer applies backpressure instead of growing memory.
+# While the producer is blocked, stream_book keeps reading the socket into its
+# own buffer, bounded by config.max_buffer_events. If that fills, the unread
+# frames are dropped and the book is rebuilt from a fresh snapshot (visible in
+# sync.stats.overflows / resyncs). States are never silently skipped: either
+# every state reaches the consumer, or a resync is recorded.
+QUEUE_MAXSIZE = 1_000
 
-async def producer(buffer: DepthEventBuffer, queue: asyncio.Queue) -> None:
+
+def make_queue() -> asyncio.Queue:
+    return asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+
+
+async def producer(
+    config: OrderBookConfig, sync: BookSynchronizer, queue: asyncio.Queue
+) -> None:
     """
-    Only job: pull validated events off the WebSocket stream as fast as
-    possible and hand them to the queue. Never does any heavy processing,
-    so it can never fall behind the incoming message rate.
+    Only job: keep the synchronized book up to date and hand each new state
+    to the queue. ``stream_book`` owns the buffer, the snapshot and the book,
+    and rebuilds the book on any gap, reconnect or crossed state.
     """
-    async for event in buffer.stream_validated_events():
-        await queue.put(event)
+    async for state in stream_book(config, sync):
+        await queue.put(state)
 
 
 async def consumer(
     queue: asyncio.Queue,
-    book: OrderBook,
+    sync: BookSynchronizer,
     extractor: FeatureExtractor,
     recorder: OrderBookRecorder,
     config: OrderBookConfig,
 ) -> None:
     """
-    Pulls events off the queue and does all the heavier work: applying
-    to the book, extracting features, recording to disk, printing.
-    Runs at its own pace, decoupled from the WebSocket receive rate.
+    Pulls book states off the queue and does the heavier work: extracting
+    features, recording to disk, printing.
     """
-    initialized = False
     event_count = 0
 
     while True:
-        event: DepthEvent = await queue.get()
-
-        if not initialized:
-            snapshot = await fetch_snapshot(config)
-            book.initialize(snapshot)
-            initialized = True
-            logger.info("Order book initialized")
-
-        book.apply_event(event)
+        state: OrderBookState = await queue.get()
         event_count += 1
 
-        state = book.top_levels()
         features = extractor.update(state)
         recorder.record(state, features)
 
         if event_count % 10 == 0:
-            derived_start = 6 + 4 * config.num_levels
-            returns_start = derived_start + 3 + 2 * config.num_levels
-
             print(f"\n--- Order Book ({config.symbol}) | update #{event_count} ---")
             print(f"Mid price : ${state.mid_price:,.2f}")
             print(f"Spread    : ${state.spread:.2f}")
-            print(f"Queue size: {queue.qsize()}")  # watch this — should stay near 0
+            print(f"Queue size: {queue.qsize()}/{queue.maxsize}")
 
-            if not book.is_valid():
-                logger.error("Book is in invalid state!")
+            print(f"Resyncs   : {sync.stats.resyncs}")
 
         queue.task_done()
 
 
 async def main():
     config = OrderBookConfig(symbol="BTCUSDT")
-    buffer = DepthEventBuffer(config)
-    book = OrderBook(config)
+    sync = BookSynchronizer(config)
     extractor = FeatureExtractor(config)
     recorder = OrderBookRecorder(config)
 
     logger.info(f"Starting order book for {config.symbol}")
     logger.info(f"Feature vector size: {feature_size(config)}")
 
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = make_queue()
 
-    producer_task = asyncio.create_task(producer(buffer, queue))
+    producer_task = asyncio.create_task(producer(config, sync, queue))
     consumer_task = asyncio.create_task(
-        consumer(queue, book, extractor, recorder, config)
+        consumer(queue, sync, extractor, recorder, config)
     )
 
     try:

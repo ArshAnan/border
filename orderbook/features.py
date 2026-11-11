@@ -85,12 +85,35 @@ class FeatureExtractor:
             returns,
         ], dtype=np.float64)
 
+        if features.shape[0] != feature_size(config):
+            raise AssertionError(
+                f"feature vector has {features.shape[0]} values, layout has {feature_size(config)}"
+            )
         return features
 
     def reset(self) -> None:
         self._mid_price_history.clear()
 
 
-def feature_size(config: OrderBookConfig) -> int:
+def feature_names(config: OrderBookConfig) -> list[str]:
+    """The feature vector layout. This list is the single source of truth:
+    ``FeatureExtractor`` fills it in this order, the Parquet recorder writes
+    one column per name, and ``OrderBookReplay`` rebuilds the vector from
+    those columns in this order."""
     n = config.num_levels
-    return 6 + (4 * n) + 3 + (2 * n) + config.num_price_returns
+    return [
+        "best_bid_price", "best_bid_qty", "best_ask_price", "best_ask_qty",
+        "mid_price", "spread",
+        *(f"bid_price_{i}" for i in range(n)),
+        *(f"bid_qty_{i}" for i in range(n)),
+        *(f"ask_price_{i}" for i in range(n)),
+        *(f"ask_qty_{i}" for i in range(n)),
+        "imbalance", "weighted_mid", "spread_bps",
+        *(f"cum_bid_vol_{i}" for i in range(n)),
+        *(f"cum_ask_vol_{i}" for i in range(n)),
+        *(f"return_{i}" for i in range(config.num_price_returns)),
+    ]
+
+
+def feature_size(config: OrderBookConfig) -> int:
+    return len(feature_names(config))
